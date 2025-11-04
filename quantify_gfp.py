@@ -37,12 +37,38 @@ from __future__ import annotations
 
 import argparse
 import csv
+import importlib.util
+import json
+import math
+import sys
 import json
 import math
 from functools import lru_cache
 from pathlib import Path
 from typing import Iterable, List, Optional
 
+
+def _ensure_dependency(module_name: str, package_hint: Optional[str] = None) -> None:
+    """Abort execution with a helpful message when a dependency is missing."""
+
+    if importlib.util.find_spec(module_name) is None:
+        package = package_hint or module_name
+        raise SystemExit(
+            "Missing dependency: '{module}'. Install it with 'pip install {package}' and retry."
+            .format(module=module_name, package=package)
+        )
+
+
+_ensure_dependency("numpy", "numpy")
+_ensure_dependency("tifffile", "tifffile")
+
+import numpy as np  # type: ignore  # noqa: E402
+import tifffile  # type: ignore  # noqa: E402
+from xml.etree import ElementTree as ET
+
+parse_metadata_directory = None
+if importlib.util.find_spec("parse_metadata") is not None:  # pragma: no cover - optional helper
+    from parse_metadata import parse_metadata_directory
 import numpy as np
 import tifffile
 from xml.etree import ElementTree as ET
@@ -586,6 +612,10 @@ def print_summary(rows: List[dict], precision: int) -> None:
         "droplet_volume_ul_cylinder",
         "intensity_per_estimated_ul",
     ]
+    if not rows:
+        print("No results were generated. Check the error messages above for details.")
+        return
+
     print("\t".join(headers))
     for row in rows:
         channel_label = (
@@ -627,6 +657,36 @@ def export_results(rows: List[dict], output_path: Path) -> None:
 def main() -> None:
     args = parse_args()
     tiff_files = iter_tiff_files(args.paths)
+    summaries: List[dict] = []
+    errors: List[tuple[Path, Exception]] = []
+    for file in tiff_files:
+        try:
+            summary = summarise_gfp_intensity(
+                file,
+                channel_name=args.channel_name,
+                channel_index=args.channel_index,
+                volume_ul=args.volume_ul,
+                metadata_dir=args.metadata_dir,
+            )
+        except Exception as exc:  # pragma: no cover - CLI feedback
+            errors.append((file, exc))
+            continue
+        summaries.append(summary)
+
+    if errors:
+        for file, exc in errors:
+            print(f"[error] {file}: {exc}", file=sys.stderr)
+
+    print_summary(summaries, precision=args.precision)
+
+    if args.output and summaries:
+        export_results(summaries, args.output)
+
+    if summaries:
+        return
+
+    raise SystemExit(1 if errors else 0)
+
     summaries = []
     for file in tiff_files:
         summary = summarise_gfp_intensity(
