@@ -22,6 +22,11 @@ channel index (0-based)::
 
     python quantify_gfp.py sample.tif --channel-index 1
 
+If the TIFF does not expose channel names, the script attempts to look up
+the acquisition order from a Leica ``MetaData`` directory located next to
+the images (or provided manually via ``--metadata-dir``) so that the GFP
+channel can be detected automatically.
+
 The script prints a table to stdout and can optionally export the
 results as JSON or CSV files via the ``--output`` flag.
 """
@@ -31,6 +36,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+from functools import lru_cache
 from pathlib import Path
 from typing import Iterable, List, Optional
 
@@ -58,6 +64,14 @@ def parse_args() -> argparse.Namespace:
         "--channel-index",
         type=int,
         help="0-based channel index to extract when metadata is unavailable.",
+    )
+    parser.add_argument(
+        "--metadata-dir",
+        type=Path,
+        help=(
+            "Optional Leica MetaData directory. When omitted the script searches "
+            "for a sibling 'MetaData' folder next to each image."
+        ),
     )
     parser.add_argument(
         "--volume-ul",
@@ -117,34 +131,91 @@ def extract_channel_names(ome_xml: Optional[str]) -> List[str]:
     return names
 
 
+def discover_metadata_directory(image_path: Path, override: Optional[Path]) -> Optional[Path]:
+    if override:
+        if not override.is_dir():
+            raise FileNotFoundError(f"Specified metadata directory not found: {override}")
+        return override.resolve()
+
+    for parent in [image_path.parent, *image_path.parents]:
+        candidate = parent / "MetaData"
+        if candidate.is_dir():
+            return candidate.resolve()
+    return None
+
+
+@lru_cache(maxsize=None)
+def load_leica_channel_names(metadata_dir: Path) -> List[str]:
+    channel_names: List[str] = []
+    seen = set()
+    xml_files = sorted(metadata_dir.rglob("*.xml"))
+    for xml_path in xml_files:
+        try:
+            root = ET.parse(xml_path).getroot()
+        except ET.ParseError:
+            continue
+        for element in root.iter():
+            tag = element.tag.split("}")[-1]
+            if tag != "WideFieldChannelInfo":
+                continue
+            name = (
+                element.attrib.get("UserDefName")
+                or element.attrib.get("FluoCubeName")
+                or element.attrib.get("ContrastingMethodName")
+                or element.attrib.get("Channel")
+            )
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            channel_names.append(name)
+    return channel_names
+
+
 def locate_channel_index(
     series: tifffile.TiffPageSeries,
     channel_name: str,
     channel_index: Optional[int],
-    channel_names: List[str],
-) -> int:
+    label_sets: List[tuple[str, List[str]]],
+) -> tuple[int, Optional[str], str]:
     if channel_index is not None:
         if channel_index < 0 or channel_index >= series.shape[series.axes.index("C")]:
             raise IndexError(
                 f"Channel index {channel_index} out of bounds for axes {series.axes}."
             )
-        return channel_index
+        resolved_label = None
+        resolved_source = "manual"
+        for source, labels in label_sets:
+            if channel_index < len(labels) and labels[channel_index]:
+                resolved_label = labels[channel_index]
+                resolved_source = source
+                break
+        return channel_index, resolved_label, resolved_source
 
     if "C" not in series.axes:
         raise ValueError(
             "The image does not expose a channel axis. Provide --channel-index."
         )
 
-    if channel_names:
-        for idx, name in enumerate(channel_names):
-            if name and channel_name.lower() in name.lower():
-                return idx
-
-    # Fallback: try to infer from series.axes order.
     channel_axis = series.axes.index("C")
     channel_count = series.shape[channel_axis]
+
+    for source, labels in label_sets:
+        for idx, name in enumerate(labels):
+            if idx >= channel_count:
+                break
+            if name and channel_name.lower() in name.lower():
+                return idx, name, source
+
+    # Fallback: try to infer from series.axes order.
     if channel_count == 1:
-        return 0
+        resolved_label = None
+        resolved_source = "implicit"
+        for source, labels in label_sets:
+            if labels:
+                resolved_label = labels[0]
+                resolved_source = source
+                break
+        return 0, resolved_label, resolved_source
 
     raise ValueError(
         "Unable to determine the GFP channel. Use --channel-index to specify it explicitly."
@@ -166,7 +237,11 @@ def extract_channel_data(
 
 
 def summarise_gfp_intensity(
-    image_path: Path, channel_name: str, channel_index: Optional[int], volume_ul: float
+    image_path: Path,
+    channel_name: str,
+    channel_index: Optional[int],
+    volume_ul: float,
+    metadata_dir: Optional[Path],
 ) -> dict:
     with tifffile.TiffFile(image_path) as tif:
         series = tif.series[0]
@@ -176,7 +251,18 @@ def summarise_gfp_intensity(
                 f"Image {image_path} is missing a channel axis; specify --channel-index."
             )
         channel_names = extract_channel_names(tif.ome_metadata)
-    idx = locate_channel_index(series, channel_name, channel_index, channel_names)
+    metadata_channels: List[str] = []
+    metadata_root = discover_metadata_directory(image_path, metadata_dir)
+    if metadata_root is not None:
+        metadata_channels = load_leica_channel_names(metadata_root)
+    label_sets: List[tuple[str, List[str]]] = []
+    if channel_names:
+        label_sets.append(("ome", channel_names))
+    if metadata_channels:
+        label_sets.append(("metadata", metadata_channels))
+    idx, resolved_label, resolved_source = locate_channel_index(
+        series, channel_name, channel_index, label_sets
+    )
     channel_data = extract_channel_data(data, series.axes, idx)
     total_intensity = float(np.sum(channel_data))
     mean_intensity = float(np.mean(channel_data))
@@ -186,7 +272,8 @@ def summarise_gfp_intensity(
     return {
         "file": image_path.name,
         "channel_index": idx,
-        "channel_name": channel_names[idx] if channel_names and idx < len(channel_names) else None,
+        "channel_name": resolved_label,
+        "channel_source": resolved_source,
         "total_intensity": total_intensity,
         "mean_intensity": mean_intensity,
         "max_intensity": max_intensity,
@@ -204,6 +291,7 @@ def print_summary(rows: List[dict], precision: int) -> None:
     headers = [
         "file",
         "channel",
+        "channel_source",
         "total_intensity",
         "mean_intensity",
         "max_intensity",
@@ -221,6 +309,7 @@ def print_summary(rows: List[dict], precision: int) -> None:
         values = [
             row["file"],
             channel_label,
+            row.get("channel_source", ""),
             format_float(row["total_intensity"], precision),
             format_float(row["mean_intensity"], precision),
             format_float(row["max_intensity"], precision),
@@ -255,6 +344,7 @@ def main() -> None:
             channel_name=args.channel_name,
             channel_index=args.channel_index,
             volume_ul=args.volume_ul,
+            metadata_dir=args.metadata_dir,
         )
         summaries.append(summary)
 
