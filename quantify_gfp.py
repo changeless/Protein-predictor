@@ -41,6 +41,8 @@ import importlib.util
 import json
 import math
 import sys
+import json
+import math
 from functools import lru_cache
 from pathlib import Path
 from typing import Iterable, List, Optional
@@ -67,6 +69,14 @@ from xml.etree import ElementTree as ET
 parse_metadata_directory = None
 if importlib.util.find_spec("parse_metadata") is not None:  # pragma: no cover - optional helper
     from parse_metadata import parse_metadata_directory
+import numpy as np
+import tifffile
+from xml.etree import ElementTree as ET
+
+try:
+    from parse_metadata import parse_metadata_directory
+except ImportError:  # pragma: no cover - fallback when helper is unavailable
+    parse_metadata_directory = None  # type: ignore
 
 
 def parse_args() -> argparse.Namespace:
@@ -676,6 +686,22 @@ def main() -> None:
         return
 
     raise SystemExit(1 if errors else 0)
+
+    summaries = []
+    for file in tiff_files:
+        summary = summarise_gfp_intensity(
+            file,
+            channel_name=args.channel_name,
+            channel_index=args.channel_index,
+            volume_ul=args.volume_ul,
+            metadata_dir=args.metadata_dir,
+        )
+        summaries.append(summary)
+
+    print_summary(summaries, precision=args.precision)
+
+    if args.output:
+        export_results(summaries, args.output)
 
 
 if __name__ == "__main__":
