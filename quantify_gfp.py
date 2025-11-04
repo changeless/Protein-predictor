@@ -3,6 +3,8 @@
 This script aggregates fluorescence measurements from multi-channel
 TIFF images (for example, droplets acquired on a Leica system) and
 reports the total GFP intensity as well as intensity per microlitre.
+When sufficient metadata is available it also estimates the droplet
+footprint and volume so that protein concentrations can be derived.
 
 Usage examples
 --------------
@@ -36,6 +38,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 from functools import lru_cache
 from pathlib import Path
 from typing import Iterable, List, Optional
@@ -43,6 +46,11 @@ from typing import Iterable, List, Optional
 import numpy as np
 import tifffile
 from xml.etree import ElementTree as ET
+
+try:
+    from parse_metadata import parse_metadata_directory
+except ImportError:  # pragma: no cover - fallback when helper is unavailable
+    parse_metadata_directory = None  # type: ignore
 
 
 def parse_args() -> argparse.Namespace:
@@ -77,7 +85,10 @@ def parse_args() -> argparse.Namespace:
         "--volume-ul",
         type=float,
         default=1.0,
-        help="Sample volume in microlitres used to normalise the intensity.",
+        help=(
+            "Sample volume in microlitres used to normalise the intensity when a droplet "
+            "estimate cannot be derived."
+        ),
     )
     parser.add_argument(
         "--output",
@@ -169,6 +180,235 @@ def load_leica_channel_names(metadata_dir: Path) -> List[str]:
             seen.add(name)
             channel_names.append(name)
     return channel_names
+
+
+@lru_cache(maxsize=None)
+def load_metadata_records(metadata_dir: Path) -> List[dict]:
+    if parse_metadata_directory is None:
+        return []
+    try:
+        return parse_metadata_directory(metadata_dir)
+    except FileNotFoundError:
+        return []
+
+
+def parse_float(value: str) -> Optional[float]:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def extract_pixel_sizes_from_metadata(metadata_dir: Path) -> tuple[Optional[float], Optional[float], Optional[float]]:
+    """Infer pixel dimensions (in µm) from Leica metadata files when possible."""
+
+    records = load_metadata_records(metadata_dir)
+    x_values: List[float] = []
+    y_values: List[float] = []
+    z_values: List[float] = []
+
+    keywords = {
+        "x": ("scalex", "scalingx", "pixelsizex", "pixelwidth", "resolutionx", "xcalibration"),
+        "y": ("scaley", "scalingy", "pixelsizey", "pixelheight", "resolutiony", "ycalibration"),
+        "z": ("scalez", "scalingz", "pixelsizez", "resolutionz", "zcalibration"),
+    }
+
+    for record in records:
+        for key, value in record.items():
+            if not isinstance(value, str):
+                continue
+            lower_key = key.lower()
+            number = parse_float(value)
+            if number is None:
+                continue
+            if any(term in lower_key for term in keywords["x"]):
+                x_values.append(number)
+            if any(term in lower_key for term in keywords["y"]):
+                y_values.append(number)
+            if any(term in lower_key for term in keywords["z"]):
+                z_values.append(number)
+
+    def pick(values: List[float]) -> Optional[float]:
+        if not values:
+            return None
+        return float(np.median(values))
+
+    return pick(x_values), pick(y_values), pick(z_values)
+
+
+def extract_pixel_sizes_from_ome(ome_xml: Optional[str]) -> tuple[Optional[float], Optional[float], Optional[float]]:
+    if not ome_xml:
+        return None, None, None
+    try:
+        root = ET.fromstring(ome_xml)
+    except ET.ParseError:
+        return None, None, None
+    ns = {"ome": "http://www.openmicroscopy.org/Schemas/OME/2016-06"}
+    pixels = root.find(".//ome:Pixels", ns)
+    if pixels is None:
+        return None, None, None
+    px = pixels.get("PhysicalSizeX")
+    py = pixels.get("PhysicalSizeY")
+    pz = pixels.get("PhysicalSizeZ")
+    return (
+        parse_float(px) if px is not None else None,
+        parse_float(py) if py is not None else None,
+        parse_float(pz) if pz is not None else None,
+    )
+
+
+def determine_pixel_sizes(
+    series: tifffile.TiffPageSeries,
+    ome_xml: Optional[str],
+    metadata_dir: Optional[Path],
+) -> tuple[Optional[float], Optional[float], Optional[float]]:
+    px, py, pz = extract_pixel_sizes_from_ome(ome_xml)
+
+    if (px is None or py is None or ("Z" in series.axes and pz is None)) and metadata_dir:
+        md_px, md_py, md_pz = extract_pixel_sizes_from_metadata(metadata_dir)
+        px = px or md_px
+        py = py or md_py
+        if "Z" in series.axes:
+            pz = pz or md_pz
+
+    # Attempt to use TIFF resolution tags when everything else fails.
+    if px is None or py is None:
+        first_page = series.pages[0]
+        x_res_tag = first_page.tags.get("XResolution")
+        y_res_tag = first_page.tags.get("YResolution")
+        unit_tag = first_page.tags.get("ResolutionUnit")
+        if x_res_tag and y_res_tag and unit_tag:
+            unit = unit_tag.value
+            # Resolution unit 3 corresponds to centimetre in TIFF spec.
+            cm_per_unit = 1.0 if unit == 3 else 2.54 if unit == 2 else None
+            if cm_per_unit:
+                x_res = x_res_tag.value[0] / x_res_tag.value[1]
+                y_res = y_res_tag.value[0] / y_res_tag.value[1]
+                if x_res:
+                    px = px or (cm_per_unit / x_res) * 1e4  # convert cm to µm
+                if y_res:
+                    py = py or (cm_per_unit / y_res) * 1e4
+
+    return px, py, pz
+
+
+def project_channel_image(data: np.ndarray, axes: str, channel_idx: int) -> np.ndarray:
+    channel_axis = axes.index("C")
+    if channel_axis != 0:
+        data = np.moveaxis(data, channel_axis, 0)
+        axes = "C" + axes[:channel_axis] + axes[channel_axis + 1 :]
+    channel_data = data[channel_idx]
+    axis_order = list(axes[1:])  # axes after removing channel
+    projection = channel_data
+    keep_axes = {"Y", "X"}
+    i = 0
+    while i < len(axis_order):
+        axis_name = axis_order[i]
+        if axis_name in keep_axes:
+            i += 1
+            continue
+        projection = projection.sum(axis=i)
+        axis_order.pop(i)
+    if set(axis_order) != {"Y", "X"}:
+        raise ValueError("Unable to project image to 2D: missing Y/X axes")
+    if axis_order == ["X", "Y"]:
+        projection = np.swapaxes(projection, 0, 1)
+    return projection.astype(np.float64, copy=False)
+
+
+def otsu_threshold(image: np.ndarray) -> float:
+    flattened = image[np.isfinite(image)].ravel()
+    if flattened.size == 0:
+        return float(np.nan)
+    min_val = float(np.min(flattened))
+    max_val = float(np.max(flattened))
+    if math.isclose(min_val, max_val):
+        return min_val
+    hist, bin_edges = np.histogram(flattened, bins=256, range=(min_val, max_val))
+    hist = hist.astype(np.float64)
+    total = hist.sum()
+    if total == 0:
+        return float(np.nan)
+    bin_centres = (bin_edges[:-1] + bin_edges[1:]) / 2.0
+    sum_total = float(np.dot(hist, bin_centres))
+    sum_background = 0.0
+    weight_background = 0.0
+    max_variance = -1.0
+    threshold = bin_centres[0]
+    for idx, count in enumerate(hist):
+        weight_background += count
+        if weight_background == 0:
+            continue
+        weight_foreground = total - weight_background
+        if weight_foreground == 0:
+            break
+        sum_background += count * bin_centres[idx]
+        mean_background = sum_background / weight_background
+        mean_foreground = (sum_total - sum_background) / weight_foreground
+        between = weight_background * weight_foreground * (mean_background - mean_foreground) ** 2
+        if between > max_variance:
+            max_variance = between
+            threshold = bin_centres[idx]
+    return threshold
+
+
+def estimate_droplet_geometry(
+    image_2d: np.ndarray,
+    pixel_size_x: Optional[float],
+    pixel_size_y: Optional[float],
+    pixel_size_z: Optional[float],
+    z_planes: int,
+) -> dict:
+    result = {
+        "pixel_size_x_um": float("nan"),
+        "pixel_size_y_um": float("nan"),
+        "pixel_size_z_um": float("nan"),
+        "area_pixels": float("nan"),
+        "area_um2": float("nan"),
+        "equivalent_diameter_um": float("nan"),
+        "volume_ul_sphere": float("nan"),
+        "volume_ul_cylinder": float("nan"),
+    }
+
+    if pixel_size_x is not None:
+        result["pixel_size_x_um"] = float(pixel_size_x)
+    if pixel_size_y is not None:
+        result["pixel_size_y_um"] = float(pixel_size_y)
+    if pixel_size_z is not None:
+        result["pixel_size_z_um"] = float(pixel_size_z)
+
+    if pixel_size_x is None or pixel_size_y is None:
+        return result
+
+    threshold = otsu_threshold(image_2d)
+    if not np.isfinite(threshold):
+        return result
+    mask = image_2d >= threshold
+    area_pixels = float(mask.sum())
+    if area_pixels == 0:
+        return result
+
+    area_um2 = area_pixels * pixel_size_x * pixel_size_y
+    equivalent_radius_um = math.sqrt(area_um2 / math.pi)
+    volume_sphere_um3 = (4.0 / 3.0) * math.pi * (equivalent_radius_um ** 3)
+    volume_ul_sphere = volume_sphere_um3 / 1e9
+
+    volume_ul_cylinder = float("nan")
+    if pixel_size_z is not None and z_planes > 0:
+        thickness_um = pixel_size_z * z_planes
+        volume_cyl_um3 = area_um2 * thickness_um
+        volume_ul_cylinder = volume_cyl_um3 / 1e9
+
+    result.update(
+        {
+            "area_pixels": area_pixels,
+            "area_um2": area_um2,
+            "equivalent_diameter_um": 2.0 * equivalent_radius_um,
+            "volume_ul_sphere": volume_ul_sphere,
+            "volume_ul_cylinder": volume_ul_cylinder,
+        }
+    )
+    return result
 
 
 def locate_channel_index(
@@ -264,11 +504,46 @@ def summarise_gfp_intensity(
         series, channel_name, channel_index, label_sets
     )
     channel_data = extract_channel_data(data, series.axes, idx)
+    pixel_size_x, pixel_size_y, pixel_size_z = determine_pixel_sizes(
+        series, tif.ome_metadata, metadata_root
+    )
+    z_planes = (
+        series.shape[series.axes.index("Z")] if "Z" in series.axes else (1 if pixel_size_z else 0)
+    )
+    try:
+        channel_projection = project_channel_image(data, series.axes, idx)
+    except ValueError:
+        channel_projection = None
+    geometry = (
+        estimate_droplet_geometry(
+            channel_projection,
+            pixel_size_x,
+            pixel_size_y,
+            pixel_size_z,
+            z_planes,
+        )
+        if channel_projection is not None
+        else {
+            "pixel_size_x_um": float("nan"),
+            "pixel_size_y_um": float("nan"),
+            "pixel_size_z_um": float("nan"),
+            "area_pixels": float("nan"),
+            "area_um2": float("nan"),
+            "equivalent_diameter_um": float("nan"),
+            "volume_ul_sphere": float("nan"),
+            "volume_ul_cylinder": float("nan"),
+        }
+    )
     total_intensity = float(np.sum(channel_data))
     mean_intensity = float(np.mean(channel_data))
     max_intensity = float(np.max(channel_data))
     min_intensity = float(np.min(channel_data))
-    intensity_per_ul = total_intensity / volume_ul if volume_ul else float("nan")
+    reported_volume = volume_ul if volume_ul else float("nan")
+    intensity_per_ul = total_intensity / reported_volume if np.isfinite(reported_volume) else float("nan")
+    est_volume_ul = geometry["volume_ul_sphere"]
+    intensity_per_estimated_ul = (
+        total_intensity / est_volume_ul if np.isfinite(est_volume_ul) and est_volume_ul > 0 else float("nan")
+    )
     return {
         "file": image_path.name,
         "channel_index": idx,
@@ -280,6 +555,15 @@ def summarise_gfp_intensity(
         "min_intensity": min_intensity,
         "volume_ul": volume_ul,
         "intensity_per_ul": intensity_per_ul,
+        "pixel_size_x_um": geometry["pixel_size_x_um"],
+        "pixel_size_y_um": geometry["pixel_size_y_um"],
+        "pixel_size_z_um": geometry["pixel_size_z_um"],
+        "droplet_area_pixels": geometry["area_pixels"],
+        "droplet_area_um2": geometry["area_um2"],
+        "droplet_equivalent_diameter_um": geometry["equivalent_diameter_um"],
+        "droplet_volume_ul_sphere": geometry["volume_ul_sphere"],
+        "droplet_volume_ul_cylinder": geometry["volume_ul_cylinder"],
+        "intensity_per_estimated_ul": intensity_per_estimated_ul,
     }
 
 
@@ -298,6 +582,9 @@ def print_summary(rows: List[dict], precision: int) -> None:
         "min_intensity",
         "volume_ul",
         "intensity_per_ul",
+        "droplet_volume_ul_sphere",
+        "droplet_volume_ul_cylinder",
+        "intensity_per_estimated_ul",
     ]
     print("\t".join(headers))
     for row in rows:
@@ -316,6 +603,9 @@ def print_summary(rows: List[dict], precision: int) -> None:
             format_float(row["min_intensity"], precision),
             format_float(row["volume_ul"], precision),
             format_float(row["intensity_per_ul"], precision),
+            format_float(row["droplet_volume_ul_sphere"], precision),
+            format_float(row["droplet_volume_ul_cylinder"], precision),
+            format_float(row["intensity_per_estimated_ul"], precision),
         ]
         print("\t".join(values))
 
